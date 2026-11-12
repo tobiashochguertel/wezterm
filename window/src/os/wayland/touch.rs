@@ -94,16 +94,9 @@ impl TouchHandler for WaylandState {
             .insert(id, TouchTarget::Content(surface_id.clone()));
         if let Some(pending) = self.surface_to_touch.get(&surface_id) {
             let mut pending = pending.lock().unwrap();
-            pending.last_positions.insert(id, position);
-            // The first live touch point acts as the pointer; later
-            // concurrent points join the surface's point set — with two
-            // or more down, vertical motion scrolls (see `motion`).
-            if pending.primary_id.is_none() {
-                pending.primary_id = Some(id);
-                pending.coords = Some(position);
-                pending.down_pos = Some(position);
-                pending.right_held = false;
-                pending.clicks.push((ButtonState::Pressed, MousePress::Left));
+            if pending.content_down(id, position) {
+                // New primary point: arm the long-press conversion with
+                // the owning window's config and schedule its timer.
                 let window_id = pending.window_id;
                 let (delay, slop) = {
                     let windows = self.windows.borrow();
@@ -120,25 +113,19 @@ impl TouchHandler for WaylandState {
                         })
                         .unwrap_or((LONG_PRESS_DELAY, LONG_PRESS_SLOP))
                 };
-                pending.long_press_slop_sq = slop * slop;
-                // A delay of 0 disables the long-press conversion
-                pending.long_press_armed = delay > Duration::ZERO;
+                let armed = pending.arm_long_press(delay, slop);
                 drop(pending);
-                if delay > Duration::ZERO {
+                if armed {
                     Self::schedule_long_press(window_id, delay);
                 }
                 self.dispatch_pending_touch(window_id);
             } else {
-                // A second finger turns pending gestures into a scroll:
-                // the long-press hold no longer applies, and the scroll
-                // speed is read once from the owning window's config.
-                pending.long_press_armed = false;
-                pending.scroll_acc = 0.0;
-                let window_id = pending.window_id;
+                // A second finger: the scroll speed is read once from
+                // the owning window's config.
                 pending.scroll_multiplier = {
                     let windows = self.windows.borrow();
                     windows
-                        .get(&window_id)
+                        .get(&pending.window_id)
                         .map(|w| w.borrow().config.touch_scroll_multiplier)
                         .unwrap_or(1.0)
                 };
@@ -181,17 +168,7 @@ impl TouchHandler for WaylandState {
             TouchTarget::Content(surface_id) => {
                 if let Some(pending) = self.surface_to_touch.get(&surface_id) {
                     let mut pending = pending.lock().unwrap();
-                    pending.last_positions.remove(&id);
-                    if pending.primary_id == Some(id) {
-                        pending.primary_id = None;
-                        pending.long_press_armed = false;
-                        let button = if pending.right_held {
-                            pending.right_held = false;
-                            MousePress::Right
-                        } else {
-                            MousePress::Left
-                        };
-                        pending.clicks.push((ButtonState::Released, button));
+                    if pending.content_up(id) {
                         self.dispatch_pending_touch(pending.window_id);
                     }
                 }
@@ -227,36 +204,7 @@ impl TouchHandler for WaylandState {
             TouchTarget::Content(surface_id) => {
                 if let Some(pending) = self.surface_to_touch.get(&surface_id) {
                     let mut pending = pending.lock().unwrap();
-                    let count = pending.last_positions.len();
-                    let Some(last) = pending.last_positions.get(&id).copied()
-                    else {
-                        return;
-                    };
-                    pending.last_positions.insert(id, position);
-                    if count >= 2 {
-                        // Two-finger drag: convert the average vertical
-                        // motion of the live points into wheel scroll.
-                        // Content follows the fingers — dragging down
-                        // scrolls back toward older output (WheelUp).
-                        let dy = position.1 - last.1;
-                        pending.scroll_acc +=
-                            dy * pending.scroll_multiplier / count as f64;
-                        while pending.scroll_acc.abs() >= SCROLL_PX_PER_NOTCH {
-                            let notch = pending.scroll_acc.signum() as i16;
-                            pending.wheels.push(notch);
-                            pending.scroll_acc -=
-                                SCROLL_PX_PER_NOTCH * pending.scroll_acc.signum();
-                        }
-                        self.dispatch_pending_touch(pending.window_id);
-                    } else if pending.primary_id == Some(id) {
-                        if let Some(down) = pending.down_pos {
-                            let dx = position.0 - down.0;
-                            let dy = position.1 - down.1;
-                            if dx * dx + dy * dy > pending.long_press_slop_sq {
-                                pending.long_press_armed = false;
-                            }
-                        }
-                        pending.coords = Some(position);
+                    if pending.content_motion(id, position) {
                         self.dispatch_pending_touch(pending.window_id);
                     }
                 }
@@ -307,16 +255,7 @@ impl TouchHandler for WaylandState {
                 TouchTarget::Content(surface_id) => {
                     if let Some(pending) = self.surface_to_touch.get(&surface_id) {
                         let mut pending = pending.lock().unwrap();
-                        pending.last_positions.remove(&id);
-                        if pending.primary_id.take().is_some() {
-                            pending.long_press_armed = false;
-                            let button = if pending.right_held {
-                                pending.right_held = false;
-                                MousePress::Right
-                            } else {
-                                MousePress::Left
-                            };
-                            pending.clicks.push((ButtonState::Released, button));
+                        if pending.content_up(id) {
                             self.dispatch_pending_touch(pending.window_id);
                         }
                     }
@@ -352,20 +291,7 @@ impl WaylandState {
             Timer::after(delay).await;
             WaylandConnection::with_window_inner(window_id, |inner| {
                 let pending = Arc::clone(&inner.pending_touch);
-                let fired = {
-                    let mut pending = pending.lock().unwrap();
-                    if pending.long_press_armed && pending.primary_id.is_some() {
-                        pending.long_press_armed = false;
-                        pending.right_held = true;
-                        pending
-                            .clicks
-                            .push((ButtonState::Released, MousePress::Left));
-                        pending.clicks.push((ButtonState::Pressed, MousePress::Right));
-                        true
-                    } else {
-                        false
-                    }
-                };
+                let fired = pending.lock().unwrap().try_long_press();
                 if fired {
                     inner.dispatch_pending_touch();
                 }
@@ -411,6 +337,111 @@ pub struct PendingTouch {
 }
 
 impl PendingTouch {
+    /// `id` went down at `pos` on this content surface. Records the
+    /// point; if it becomes the primary point, queues `Press(Left)`
+    /// and returns true — the caller should then apply the window's
+    /// config via `arm_long_press` and schedule the conversion timer.
+    /// Otherwise this is a secondary point: any pending long-press is
+    /// cancelled and subsequent motion scrolls (see `content_motion`).
+    fn content_down(&mut self, id: i32, pos: (f64, f64)) -> bool {
+        self.last_positions.insert(id, pos);
+        if self.primary_id.is_none() {
+            self.primary_id = Some(id);
+            self.coords = Some(pos);
+            self.down_pos = Some(pos);
+            self.right_held = false;
+            self.clicks.push((ButtonState::Pressed, MousePress::Left));
+            true
+        } else {
+            self.long_press_armed = false;
+            self.scroll_acc = 0.0;
+            false
+        }
+    }
+
+    /// Configure the pending long-press conversion. `delay` of zero
+    /// disables it. Returns whether the conversion is armed.
+    fn arm_long_press(&mut self, delay: Duration, slop: f64) -> bool {
+        self.long_press_slop_sq = slop * slop;
+        self.long_press_armed = delay > Duration::ZERO;
+        self.long_press_armed
+    }
+
+    /// `id` moved to `pos`. With a single point this is a primary drag
+    /// (updates coords for the next Move event and cancels the
+    /// long-press once the slop radius is left). With two or more
+    /// points, vertical motion of the moving point — averaged across
+    /// the live points — accumulates into wheel notches: content
+    /// follows the fingers, so dragging down scrolls back toward older
+    /// output (positive WheelUp notches). Returns true when the queued
+    /// output should be dispatched.
+    fn content_motion(&mut self, id: i32, pos: (f64, f64)) -> bool {
+        let count = self.last_positions.len();
+        let Some(last) = self.last_positions.get(&id).copied() else {
+            return false;
+        };
+        self.last_positions.insert(id, pos);
+        if count >= 2 {
+            let dy = pos.1 - last.1;
+            self.scroll_acc += dy * self.scroll_multiplier / count as f64;
+            while self.scroll_acc.abs() >= SCROLL_PX_PER_NOTCH {
+                let notch = self.scroll_acc.signum() as i16;
+                self.wheels.push(notch);
+                self.scroll_acc -= SCROLL_PX_PER_NOTCH * self.scroll_acc.signum();
+            }
+            true
+        } else if self.primary_id == Some(id) {
+            if let Some(down) = self.down_pos {
+                let dx = pos.0 - down.0;
+                let dy = pos.1 - down.1;
+                if dx * dx + dy * dy > self.long_press_slop_sq {
+                    self.long_press_armed = false;
+                }
+            }
+            self.coords = Some(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `id` was lifted. Dropping it from the point set; if it was the
+    /// primary, queues the matching button release — `Release(Right)`
+    /// when the long-press conversion fired, `Release(Left)` otherwise.
+    /// Also used for `wl_touch.cancel`, which drops every point.
+    fn content_up(&mut self, id: i32) -> bool {
+        self.last_positions.remove(&id);
+        if self.primary_id.take() == Some(id) {
+            self.long_press_armed = false;
+            let button = if self.right_held {
+                self.right_held = false;
+                MousePress::Right
+            } else {
+                MousePress::Left
+            };
+            self.clicks.push((ButtonState::Released, button));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The long-press delay elapsed. If the gesture is still armed
+    /// (primary held, no drag, no second finger), convert the held
+    /// left button into a held right button: Release(Left)+Press(Right)
+    /// and return true so the caller dispatches.
+    fn try_long_press(&mut self) -> bool {
+        if self.long_press_armed && self.primary_id.is_some() {
+            self.long_press_armed = false;
+            self.right_held = true;
+            self.clicks.push((ButtonState::Released, MousePress::Left));
+            self.clicks.push((ButtonState::Pressed, MousePress::Right));
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn create(window_id: usize) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             window_id,
@@ -450,5 +481,160 @@ impl PendingTouch {
 
     pub(super) fn coords(pending: &Arc<Mutex<Self>>) -> Option<(f64, f64)> {
         pending.lock().unwrap().coords.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending() -> PendingTouch {
+        PendingTouch {
+            window_id: 1,
+            primary_id: None,
+            coords: None,
+            clicks: vec![],
+            down_pos: None,
+            long_press_slop_sq: LONG_PRESS_SLOP * LONG_PRESS_SLOP,
+            long_press_armed: false,
+            right_held: false,
+            last_positions: std::collections::HashMap::new(),
+            scroll_acc: 0.0,
+            scroll_multiplier: 1.0,
+            wheels: vec![],
+        }
+    }
+
+    #[test]
+    fn tap_queues_left_press_and_release() {
+        let mut p = pending();
+        assert!(p.content_down(0, (10.0, 20.0)));
+        assert_eq!(
+            p.clicks,
+            vec![(ButtonState::Pressed, MousePress::Left)]
+        );
+        assert!(p.content_up(0));
+        assert_eq!(
+            p.clicks,
+            vec![
+                (ButtonState::Pressed, MousePress::Left),
+                (ButtonState::Released, MousePress::Left),
+            ]
+        );
+    }
+
+    #[test]
+    fn second_point_cancels_long_press() {
+        let mut p = pending();
+        assert!(p.content_down(0, (10.0, 10.0)));
+        assert!(p.arm_long_press(Duration::from_millis(500), 10.0));
+        assert!(!p.content_down(1, (10.0, 30.0)));
+        assert!(!p.try_long_press());
+    }
+
+    #[test]
+    fn long_press_converts_to_right_button() {
+        let mut p = pending();
+        p.content_down(0, (10.0, 10.0));
+        p.arm_long_press(Duration::from_millis(500), 10.0);
+        assert!(p.try_long_press());
+        assert_eq!(
+            p.clicks,
+            vec![
+                (ButtonState::Pressed, MousePress::Left),
+                (ButtonState::Released, MousePress::Left),
+                (ButtonState::Pressed, MousePress::Right),
+            ]
+        );
+        // Lifting the finger releases the right button, not the left
+        assert!(p.content_up(0));
+        assert_eq!(
+            p.clicks.last(),
+            Some(&(ButtonState::Released, MousePress::Right))
+        );
+    }
+
+    #[test]
+    fn drag_beyond_slop_cancels_long_press() {
+        let mut p = pending();
+        p.content_down(0, (10.0, 10.0));
+        p.arm_long_press(Duration::from_millis(500), 10.0);
+        assert!(p.content_motion(0, (10.0, 25.0)));
+        assert!(!p.try_long_press());
+        // ...but a small move inside the radius keeps it armed
+        let mut q = pending();
+        q.content_down(0, (10.0, 10.0));
+        q.arm_long_press(Duration::from_millis(500), 10.0);
+        q.content_motion(0, (13.0, 13.0));
+        assert!(q.try_long_press());
+    }
+
+    #[test]
+    fn zero_delay_disables_long_press() {
+        let mut p = pending();
+        p.content_down(0, (10.0, 10.0));
+        assert!(!p.arm_long_press(Duration::ZERO, 10.0));
+        assert!(!p.try_long_press());
+    }
+
+    #[test]
+    fn two_finger_drag_emits_wheel_notches() {
+        let mut p = pending();
+        p.content_down(0, (100.0, 100.0));
+        p.content_down(1, (100.0, 140.0));
+        // Both fingers drag down 200px -> +5 notches of WheelUp
+        // (200 * 1.0 / 2 points each = 200 accumulated, 40 per notch)
+        for i in 1..=10 {
+            p.content_motion(0, (100.0, 100.0 + i as f64 * 20.0));
+            p.content_motion(1, (100.0, 140.0 + i as f64 * 20.0));
+        }
+        assert_eq!(p.wheels.iter().sum::<i16>(), 5);
+        // Dragging back up produces WheelDown
+        for i in 1..=10 {
+            p.content_motion(0, (100.0, 300.0 - i as f64 * 20.0));
+            p.content_motion(1, (100.0, 340.0 - i as f64 * 20.0));
+        }
+        assert_eq!(p.wheels.iter().sum::<i16>(), 0);
+    }
+
+    #[test]
+    fn single_finger_drag_does_not_scroll() {
+        let mut p = pending();
+        p.content_down(0, (100.0, 100.0));
+        p.content_motion(0, (100.0, 300.0));
+        assert!(p.wheels.is_empty());
+        assert_eq!(p.coords, Some((100.0, 300.0)));
+    }
+
+    #[test]
+    fn scroll_multiplier_scales_speed() {
+        let mut p = pending();
+        p.scroll_multiplier = 2.0;
+        p.content_down(0, (0.0, 0.0));
+        p.content_down(1, (0.0, 50.0));
+        p.content_motion(0, (0.0, 200.0));
+        assert_eq!(p.wheels.iter().sum::<i16>(), 5);
+        // ...and 0 disables scrolling
+        let mut q = pending();
+        q.scroll_multiplier = 0.0;
+        q.content_down(0, (0.0, 0.0));
+        q.content_down(1, (0.0, 50.0));
+        q.content_motion(0, (0.0, 400.0));
+        assert!(q.wheels.is_empty());
+    }
+
+    #[test]
+    fn cancel_releases_matching_button() {
+        // content_up doubles as the per-point cancel path
+        let mut p = pending();
+        p.content_down(0, (0.0, 0.0));
+        p.arm_long_press(Duration::from_millis(500), 10.0);
+        p.try_long_press();
+        assert!(p.content_up(0));
+        assert_eq!(
+            p.clicks.last(),
+            Some(&(ButtonState::Released, MousePress::Right))
+        );
+        assert!(!p.right_held);
     }
 }

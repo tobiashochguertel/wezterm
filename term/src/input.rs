@@ -109,3 +109,69 @@ impl LastMouseClick {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::MouseButton;
+
+    fn pos(col: usize) -> ClickPosition {
+        ClickPosition {
+            column: col,
+            row: 0,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+        }
+    }
+
+    #[test]
+    fn streak_increments_within_interval() {
+        let click = LastMouseClick::new(MouseButton::Left, pos(1));
+        let next = click.add_with_interval(
+            MouseButton::Left,
+            pos(1),
+            Duration::from_secs(60),
+        );
+        assert_eq!(next.streak, 2);
+        let third = next.add_with_interval(
+            MouseButton::Left,
+            pos(1),
+            Duration::from_secs(60),
+        );
+        assert_eq!(third.streak, 3);
+    }
+
+    #[test]
+    fn streak_resets_on_expiry_position_and_button() {
+        let click = LastMouseClick::new(MouseButton::Left, pos(1));
+        // A zero-length interval can never contain a subsequent click
+        assert_eq!(
+            click
+                .add_with_interval(MouseButton::Left, pos(1), Duration::ZERO)
+                .streak,
+            1
+        );
+        // Different cell resets
+        assert_eq!(
+            click
+                .add_with_interval(
+                    MouseButton::Left,
+                    pos(2),
+                    Duration::from_secs(60)
+                )
+                .streak,
+            1
+        );
+        // Different button resets
+        assert_eq!(
+            click
+                .add_with_interval(
+                    MouseButton::Right,
+                    pos(1),
+                    Duration::from_secs(60)
+                )
+                .streak,
+            1
+        );
+    }
+}
