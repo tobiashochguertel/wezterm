@@ -848,6 +848,8 @@ impl WaylandWindowInner {
     /// touch point is treated as the pointer — motion becomes Move and
     /// down/up become Press/Release of the left button, so taps and drags
     /// behave exactly like clicks and selections throughout the UI.
+    /// A held-down primary point can also be converted into a held right
+    /// button by the long-press timer (see touch.rs).
     pub(crate) fn dispatch_pending_touch(&mut self) {
         let pending_touch = Arc::clone(&self.pending_touch);
 
@@ -871,17 +873,22 @@ impl WaylandWindowInner {
             self.refresh_frame();
         }
 
-        while let Some(state) = PendingTouch::next_click(&pending_touch) {
+        while let Some((state, button)) = PendingTouch::next_click(&pending_touch) {
+            let flag = match button {
+                MousePress::Left => MouseButtons::LEFT,
+                MousePress::Right => MouseButtons::RIGHT,
+                MousePress::Middle => MouseButtons::MIDDLE,
+            };
             if state == ButtonState::Pressed {
-                self.mouse_buttons |= MouseButtons::LEFT;
+                self.mouse_buttons |= flag;
             } else {
-                self.mouse_buttons -= MouseButtons::LEFT;
+                self.mouse_buttons -= flag;
             }
 
             let event = MouseEvent {
                 kind: match state {
-                    ButtonState::Pressed => MouseEventKind::Press(MousePress::Left),
-                    _ => MouseEventKind::Release(MousePress::Left),
+                    ButtonState::Pressed => MouseEventKind::Press(button),
+                    _ => MouseEventKind::Release(button),
                 },
                 coords: self.last_mouse_coords,
                 screen_coords: ScreenPoint::new(

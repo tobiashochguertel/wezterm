@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_io::Timer;
 use smithay_client_toolkit::compositor::SurfaceData;
 use smithay_client_toolkit::reexports::csd_frame::{DecorationsFrame, FrameClick};
 use smithay_client_toolkit::seat::touch::TouchHandler;
@@ -9,9 +10,17 @@ use wayland_client::protocol::wl_pointer::ButtonState;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::protocol::wl_touch::WlTouch;
 use wayland_client::{Connection, Proxy, QueueHandle};
+use wezterm_input_types::MousePress;
 
 use super::state::WaylandState;
 use super::{SurfaceUserData, WaylandConnection};
+
+/// How long the primary touch point must stay down and roughly in
+/// place before it is converted into a held right button.
+const LONG_PRESS_DELAY: Duration = Duration::from_millis(500);
+/// Squared slop radius (in surface-local units) for the long-press
+/// conversion: moving further than this cancels it and stays a drag.
+const LONG_PRESS_SLOP_SQ: f64 = 100.0;
 
 /// Where a live touch id went down.
 #[derive(Clone, Debug)]
@@ -87,8 +96,14 @@ impl TouchHandler for WaylandState {
             if pending.primary_id.is_none() {
                 pending.primary_id = Some(id);
                 pending.coords = Some(position);
-                pending.clicks.push(ButtonState::Pressed);
-                self.dispatch_pending_touch(pending.window_id);
+                pending.down_pos = Some(position);
+                pending.long_press_armed = true;
+                pending.right_held = false;
+                pending.clicks.push((ButtonState::Pressed, MousePress::Left));
+                let window_id = pending.window_id;
+                drop(pending);
+                Self::schedule_long_press(window_id);
+                self.dispatch_pending_touch(window_id);
             }
         }
     }
@@ -130,7 +145,14 @@ impl TouchHandler for WaylandState {
                     let mut pending = pending.lock().unwrap();
                     if pending.primary_id == Some(id) {
                         pending.primary_id = None;
-                        pending.clicks.push(ButtonState::Released);
+                        pending.long_press_armed = false;
+                        let button = if pending.right_held {
+                            pending.right_held = false;
+                            MousePress::Right
+                        } else {
+                            MousePress::Left
+                        };
+                        pending.clicks.push((ButtonState::Released, button));
                         self.dispatch_pending_touch(pending.window_id);
                     }
                 }
@@ -167,6 +189,13 @@ impl TouchHandler for WaylandState {
                 if let Some(pending) = self.surface_to_touch.get(&surface_id) {
                     let mut pending = pending.lock().unwrap();
                     if pending.primary_id == Some(id) {
+                        if let Some(down) = pending.down_pos {
+                            let dx = position.0 - down.0;
+                            let dy = position.1 - down.1;
+                            if dx * dx + dy * dy > LONG_PRESS_SLOP_SQ {
+                                pending.long_press_armed = false;
+                            }
+                        }
                         pending.coords = Some(position);
                         self.dispatch_pending_touch(pending.window_id);
                     }
@@ -219,7 +248,14 @@ impl TouchHandler for WaylandState {
                     if let Some(pending) = self.surface_to_touch.get(&surface_id) {
                         let mut pending = pending.lock().unwrap();
                         if pending.primary_id.take().is_some() {
-                            pending.clicks.push(ButtonState::Released);
+                            pending.long_press_armed = false;
+                            let button = if pending.right_held {
+                                pending.right_held = false;
+                                MousePress::Right
+                            } else {
+                                MousePress::Left
+                            };
+                            pending.clicks.push((ButtonState::Released, button));
                             self.dispatch_pending_touch(pending.window_id);
                         }
                     }
@@ -240,6 +276,43 @@ impl WaylandState {
             Ok(())
         });
     }
+
+    /// Arm the long-press detector for a touch that just went down on
+    /// `window_id`. If the primary point is still held and hasn't left
+    /// the slop radius when the delay expires, the held left button is
+    /// converted into a held right button: Release(Left)+Press(Right).
+    /// That mirrors how touch platforms map press-and-hold to a
+    /// secondary click and unlocks right-click-only behavior such as
+    /// the tab navigator and application mouse reporting. Dragging
+    /// while held continues as a right-drag, and lifting the finger
+    /// releases the right button instead of the left.
+    fn schedule_long_press(window_id: usize) {
+        promise::spawn::spawn_into_main_thread(async move {
+            Timer::after(LONG_PRESS_DELAY).await;
+            WaylandConnection::with_window_inner(window_id, |inner| {
+                let pending = Arc::clone(&inner.pending_touch);
+                let fired = {
+                    let mut pending = pending.lock().unwrap();
+                    if pending.long_press_armed && pending.primary_id.is_some() {
+                        pending.long_press_armed = false;
+                        pending.right_held = true;
+                        pending
+                            .clicks
+                            .push((ButtonState::Released, MousePress::Left));
+                        pending.clicks.push((ButtonState::Pressed, MousePress::Right));
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if fired {
+                    inner.dispatch_pending_touch();
+                }
+                Ok(())
+            });
+        })
+        .detach();
+    }
 }
 
 /// Per-window buffered touch state, mirroring PendingMouse.
@@ -250,8 +323,16 @@ pub struct PendingTouch {
     primary_id: Option<i32>,
     /// Most recent surface-local coordinates of the primary point.
     coords: Option<(f64, f64)>,
-    /// Queued press/release transitions to dispatch.
-    clicks: Vec<ButtonState>,
+    /// Queued (state, button) transitions to dispatch.
+    clicks: Vec<(ButtonState, MousePress)>,
+    /// Where the primary point went down; anchors the long-press
+    /// slop radius.
+    down_pos: Option<(f64, f64)>,
+    /// The long-press conversion timer may still fire.
+    long_press_armed: bool,
+    /// The long-press timer converted this touch into a held right
+    /// button; the matching release must be for the right button.
+    right_held: bool,
 }
 
 impl PendingTouch {
@@ -261,10 +342,15 @@ impl PendingTouch {
             primary_id: None,
             coords: None,
             clicks: vec![],
+            down_pos: None,
+            long_press_armed: false,
+            right_held: false,
         }))
     }
 
-    pub(super) fn next_click(pending: &Arc<Mutex<Self>>) -> Option<ButtonState> {
+    pub(super) fn next_click(
+        pending: &Arc<Mutex<Self>>,
+    ) -> Option<(ButtonState, MousePress)> {
         let mut pending = pending.lock().unwrap();
         if pending.clicks.is_empty() {
             None
