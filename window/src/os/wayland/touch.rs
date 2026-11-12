@@ -44,7 +44,9 @@ impl TouchHandler for WaylandState {
         position: (f64, f64),
     ) {
         *self.last_serial.borrow_mut() = serial;
-        self.last_seat = self.touch_seat.clone();
+        if let Some(seat) = self.touch_seat.clone() {
+            self.press_grab = Some((serial, seat));
+        }
         let surface_id = surface.id();
 
         // Decoration subsurfaces route into the CSD frame, which hit-tests
@@ -101,10 +103,12 @@ impl TouchHandler for WaylandState {
         id: i32,
     ) {
         *self.last_serial.borrow_mut() = serial;
-        self.last_seat = self.touch_seat.clone();
         let Some(target) = self.touch_to_surface.remove(&id) else {
             return;
         };
+        if self.touch_to_surface.is_empty() {
+            self.press_grab = None;
+        }
 
         match target {
             TouchTarget::Frame(_surface_id, window_id) => {
@@ -197,6 +201,7 @@ impl TouchHandler for WaylandState {
         // gesture). Drop our touch points, but synthesize releases for any
         // still-pressed primaries so windows and the decorations frame
         // aren't left with a stuck held button.
+        self.press_grab = None;
         for (_, target) in self.touch_to_surface.drain().collect::<Vec<(i32, TouchTarget)>>()
         {
             match target {

@@ -42,10 +42,21 @@ impl PointerHandler for WaylandState {
             }
             if let Some(serial) = event_serial(&evt) {
                 *self.last_serial.borrow_mut() = serial;
-                self.last_seat = pointer
+                let seat = pointer
                     .data::<PointerUserData>()
                     .map(|udata| udata.pdata.seat().clone());
                 pstate.serial = serial;
+                match evt.kind {
+                    PointerEventKind::Press { .. } => {
+                        if let Some(seat) = seat {
+                            self.press_grab = Some((serial, seat));
+                        }
+                    }
+                    PointerEventKind::Release { .. } => {
+                        self.press_grab = None;
+                    }
+                    _ => {}
+                }
             }
             if let Some(pending) = self
                 .surface_to_pending

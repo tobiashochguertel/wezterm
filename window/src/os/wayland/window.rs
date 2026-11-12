@@ -1308,17 +1308,18 @@ impl WaylandWindowInner {
     }
 
     /// Ask the compositor to start an interactive window move using the
-    /// seat and grab serial of the most recent press — the mechanism the
-    /// tab bar drag-to-move gesture relies on.
+    /// seat and grab serial of the press that is still held — the
+    /// mechanism the tab bar drag-to-move gesture relies on. The serial
+    /// must come from that live grab: anything else (e.g. a release or
+    /// motion serial seen in between) makes the request invalid.
     pub(super) fn request_drag_move(&self) {
         let Some(window) = self.window.as_ref() else {
             return;
         };
         let conn = WaylandConnection::get().unwrap().wayland();
         let state = conn.wayland_state.borrow();
-        let serial = *state.last_serial.borrow();
-        if let Some(seat) = state.last_seat.clone() {
-            window.move_(&seat, serial);
+        if let Some((serial, seat)) = state.press_grab.as_ref() {
+            window.move_(seat, *serial);
         }
     }
 

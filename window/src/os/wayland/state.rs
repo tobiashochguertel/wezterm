@@ -71,9 +71,12 @@ pub(super) struct WaylandState {
     pub(super) touch: Option<WlTouch>,
     /// The seat that owns `touch`, kept for xdg_toplevel move/resize.
     pub(super) touch_seat: Option<WlSeat>,
-    /// The seat that produced the grab serial in `last_serial`, for
-    /// xdg_toplevel move/resize requests driven by either device.
-    pub(super) last_seat: Option<WlSeat>,
+    /// (serial, seat) of the pointer button or touch that is currently
+    /// held down, if any. `xdg_toplevel.move`/resize need the serial of
+    /// the *press* that initiated the grab — not whatever the latest
+    /// event happened to be — so it is tracked separately from
+    /// `last_serial` and cleared on release.
+    pub(super) press_grab: Option<(u32, WlSeat)>,
     pub(super) surface_to_touch: HashMap<ObjectId, Arc<Mutex<PendingTouch>>>,
     /// Maps a live touch id to the surface it went down on.
     pub(super) touch_to_surface: HashMap<i32, TouchTarget>,
@@ -144,7 +147,7 @@ impl WaylandState {
             surface_to_pending: HashMap::new(),
             touch: None,
             touch_seat: None,
-            last_seat: None,
+            press_grab: None,
             surface_to_touch: HashMap::new(),
             touch_to_surface: HashMap::new(),
             data_device_manager_state: DataDeviceManagerState::bind(globals, qh)?,
