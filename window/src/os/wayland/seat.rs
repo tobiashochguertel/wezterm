@@ -54,7 +54,10 @@ impl SeatHandler for WaylandState {
             Capability::Touch if self.touch.is_none() => {
                 log::trace!("Setting touch capability");
                 match self.seat.get_touch(qh, &seat) {
-                    Ok(touch) => self.touch = Some(touch),
+                    Ok(touch) => {
+                        self.touch = Some(touch);
+                        self.touch_seat = Some(seat.clone());
+                    }
                     Err(err) => log::warn!("Couldn't bind touch: {err}"),
                 }
             }
@@ -92,6 +95,7 @@ impl SeatHandler for WaylandState {
             Capability::Touch => {
                 log::trace!("Lost touch capability");
                 self.touch.take().map(|t| t.release());
+                self.touch_seat = None;
             }
             _ => {}
         }

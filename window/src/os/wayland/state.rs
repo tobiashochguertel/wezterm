@@ -29,6 +29,7 @@ use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_output::WlOutput;
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_touch::WlTouch;
 use wayland_client::{delegate_dispatch, Connection, QueueHandle};
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
@@ -41,7 +42,7 @@ use crate::x11::KeyboardWithFallback;
 use super::copy_and_paste::CopyPasteOffer;
 use super::inputhandler::{TextInputData, TextInputState};
 use super::pointer::{PendingMouse, PointerUserData};
-use super::touch::PendingTouch;
+use super::touch::{PendingTouch, TouchTarget};
 use super::{OutputManagerData, OutputManagerState, SurfaceUserData, WaylandWindowInner};
 
 // We can't combine WaylandState and WaylandConnection together because
@@ -68,9 +69,14 @@ pub(super) struct WaylandState {
     pub(super) pointer: Option<ThemedPointer<PointerUserData>>,
     pub(super) surface_to_pending: HashMap<ObjectId, Arc<Mutex<PendingMouse>>>,
     pub(super) touch: Option<WlTouch>,
+    /// The seat that owns `touch`, kept for xdg_toplevel move/resize.
+    pub(super) touch_seat: Option<WlSeat>,
+    /// The seat that produced the grab serial in `last_serial`, for
+    /// xdg_toplevel move/resize requests driven by either device.
+    pub(super) last_seat: Option<WlSeat>,
     pub(super) surface_to_touch: HashMap<ObjectId, Arc<Mutex<PendingTouch>>>,
     /// Maps a live touch id to the surface it went down on.
-    pub(super) touch_to_surface: HashMap<i32, ObjectId>,
+    pub(super) touch_to_surface: HashMap<i32, TouchTarget>,
 
     /// Bound global for wl_data_device_manager; factory for data devices and copy-paste sources.
     pub(super) data_device_manager_state: DataDeviceManagerState,
@@ -137,6 +143,8 @@ impl WaylandState {
             pointer: None,
             surface_to_pending: HashMap::new(),
             touch: None,
+            touch_seat: None,
+            last_seat: None,
             surface_to_touch: HashMap::new(),
             touch_to_surface: HashMap::new(),
             data_device_manager_state: DataDeviceManagerState::bind(globals, qh)?,

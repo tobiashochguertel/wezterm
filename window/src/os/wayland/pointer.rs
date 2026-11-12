@@ -42,6 +42,9 @@ impl PointerHandler for WaylandState {
             }
             if let Some(serial) = event_serial(&evt) {
                 *self.last_serial.borrow_mut() = serial;
+                self.last_seat = pointer
+                    .data::<PointerUserData>()
+                    .map(|udata| udata.pdata.seat().clone());
                 pstate.serial = serial;
             }
             if let Some(pending) = self
@@ -199,6 +202,12 @@ fn event_serial(event: &PointerEvent) -> Option<u32> {
 impl WaylandState {
     fn pointer_window_frame(&mut self, pointer: &WlPointer, events: &[PointerEvent]) {
         let windows = self.windows.borrow();
+        let seat = pointer
+            .data::<PointerUserData>()
+            .unwrap()
+            .pdata
+            .seat()
+            .clone();
 
         for evt in events {
             let surface = &evt.surface;
@@ -250,7 +259,7 @@ impl WaylandState {
                         if let Some(action) =
                             inner.window_frame.on_click(Duration::ZERO, click, pressed)
                         {
-                            inner.frame_action(pointer, serial, action);
+                            inner.frame_action(&seat, serial, action);
                         }
                     }
                     _ => {}

@@ -37,8 +37,9 @@ use smithay_client_toolkit::shell::xdg::XdgSurface;
 use smithay_client_toolkit::shell::WaylandSurface;
 use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_keyboard::{Event as WlKeyboardEvent, KeyState};
-use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
+use wayland_client::protocol::wl_pointer::ButtonState;
 use wayland_client::protocol::wl_region::WlRegion;
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection as WConnection, Dispatch, Proxy, QueueHandle};
 use wayland_egl::{is_available as egl_is_available, WlEglSurface};
@@ -83,7 +84,7 @@ impl WaylandDimensions for Dimensions {
     }
 }
 
-use super::pointer::{PendingMouse, PointerUserData};
+use super::pointer::PendingMouse;
 use super::state::WaylandState;
 use super::touch::PendingTouch;
 
@@ -533,6 +534,13 @@ impl WindowOps for WaylandWindow {
         let config = config.clone();
         WaylandConnection::with_window_inner(self.0, move |inner| {
             inner.config_did_change(config);
+            Ok(())
+        });
+    }
+
+    fn request_drag_move(&self) {
+        WaylandConnection::with_window_inner(self.0, move |inner| {
+            inner.request_drag_move();
             Ok(())
         });
     }
@@ -1299,9 +1307,22 @@ impl WaylandWindowInner {
         }
     }
 
-    pub(super) fn frame_action(&mut self, pointer: &WlPointer, serial: u32, action: FrameAction) {
-        let pointer_data = pointer.data::<PointerUserData>().unwrap();
-        let seat = pointer_data.pdata.seat();
+    /// Ask the compositor to start an interactive window move using the
+    /// seat and grab serial of the most recent press — the mechanism the
+    /// tab bar drag-to-move gesture relies on.
+    pub(super) fn request_drag_move(&self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let conn = WaylandConnection::get().unwrap().wayland();
+        let state = conn.wayland_state.borrow();
+        let serial = *state.last_serial.borrow();
+        if let Some(seat) = state.last_seat.clone() {
+            window.move_(&seat, serial);
+        }
+    }
+
+    pub(super) fn frame_action(&mut self, seat: &WlSeat, serial: u32, action: FrameAction) {
         match action {
             FrameAction::Close => self.events.dispatch(WindowEvent::CloseRequested),
             FrameAction::Minimize => self.window.as_ref().unwrap().set_minimized(),
