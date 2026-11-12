@@ -150,7 +150,11 @@ impl super::TermWindow {
 
                 let click = match self.last_mouse_click.take() {
                     None => LastMouseClick::new(button, click_position),
-                    Some(click) => click.add(button, click_position),
+                    Some(click) => click.add_with_interval(
+                        button,
+                        click_position,
+                        Duration::from_millis(self.config.mouse_double_click_ms),
+                    ),
                 };
                 self.last_mouse_click = Some(click);
                 self.current_mouse_buttons.retain(|p| p != press);

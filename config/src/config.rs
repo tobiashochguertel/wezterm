@@ -455,6 +455,24 @@ pub struct Config {
     #[dynamic(default)]
     pub disable_default_mouse_bindings: bool,
 
+    /// The interval, in milliseconds, within which successive clicks
+    /// of the same button on the same cell are counted as a
+    /// click streak (double click, triple click, ...).
+    #[dynamic(default = "default_mouse_double_click_ms")]
+    pub mouse_double_click_ms: u64,
+
+    /// On touch devices (Wayland), how long the primary touch point
+    /// must stay down before it is converted into a right button
+    /// press, in milliseconds. 0 disables long-press conversion.
+    #[dynamic(default = "default_touch_long_press_ms")]
+    pub touch_long_press_ms: u64,
+
+    /// On touch devices (Wayland), how far (in surface-local units,
+    /// roughly logical pixels) the primary touch point may move before
+    /// a pending long-press is cancelled and remains a drag.
+    #[dynamic(default = "default_touch_long_press_slop")]
+    pub touch_long_press_slop: f64,
+
     #[dynamic(default)]
     pub daemon_options: DaemonOptions,
 
@@ -1704,6 +1722,18 @@ fn default_swap_backspace_and_delete() -> bool {
 
 fn default_scrollback_lines() -> usize {
     3500
+}
+
+fn default_mouse_double_click_ms() -> u64 {
+    500
+}
+
+fn default_touch_long_press_ms() -> u64 {
+    500
+}
+
+fn default_touch_long_press_slop() -> f64 {
+    10.0
 }
 
 const MAX_SCROLLBACK_LINES: usize = 999_999_999;

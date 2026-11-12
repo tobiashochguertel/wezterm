@@ -20,7 +20,7 @@ use super::{SurfaceUserData, WaylandConnection};
 const LONG_PRESS_DELAY: Duration = Duration::from_millis(500);
 /// Squared slop radius (in surface-local units) for the long-press
 /// conversion: moving further than this cancels it and stays a drag.
-const LONG_PRESS_SLOP_SQ: f64 = 100.0;
+const LONG_PRESS_SLOP: f64 = 10.0;
 
 /// Where a live touch id went down.
 #[derive(Clone, Debug)]
@@ -97,12 +97,31 @@ impl TouchHandler for WaylandState {
                 pending.primary_id = Some(id);
                 pending.coords = Some(position);
                 pending.down_pos = Some(position);
-                pending.long_press_armed = true;
                 pending.right_held = false;
                 pending.clicks.push((ButtonState::Pressed, MousePress::Left));
                 let window_id = pending.window_id;
+                let (delay, slop) = {
+                    let windows = self.windows.borrow();
+                    windows
+                        .get(&window_id)
+                        .map(|w| {
+                            let inner = w.borrow();
+                            (
+                                Duration::from_millis(
+                                    inner.config.touch_long_press_ms,
+                                ),
+                                inner.config.touch_long_press_slop,
+                            )
+                        })
+                        .unwrap_or((LONG_PRESS_DELAY, LONG_PRESS_SLOP))
+                };
+                pending.long_press_slop_sq = slop * slop;
+                // A delay of 0 disables the long-press conversion
+                pending.long_press_armed = delay > Duration::ZERO;
                 drop(pending);
-                Self::schedule_long_press(window_id);
+                if delay > Duration::ZERO {
+                    Self::schedule_long_press(window_id, delay);
+                }
                 self.dispatch_pending_touch(window_id);
             }
         }
@@ -192,7 +211,7 @@ impl TouchHandler for WaylandState {
                         if let Some(down) = pending.down_pos {
                             let dx = position.0 - down.0;
                             let dy = position.1 - down.1;
-                            if dx * dx + dy * dy > LONG_PRESS_SLOP_SQ {
+                            if dx * dx + dy * dy > pending.long_press_slop_sq {
                                 pending.long_press_armed = false;
                             }
                         }
@@ -286,9 +305,9 @@ impl WaylandState {
     /// the tab navigator and application mouse reporting. Dragging
     /// while held continues as a right-drag, and lifting the finger
     /// releases the right button instead of the left.
-    fn schedule_long_press(window_id: usize) {
+    fn schedule_long_press(window_id: usize, delay: Duration) {
         promise::spawn::spawn_into_main_thread(async move {
-            Timer::after(LONG_PRESS_DELAY).await;
+            Timer::after(delay).await;
             WaylandConnection::with_window_inner(window_id, |inner| {
                 let pending = Arc::clone(&inner.pending_touch);
                 let fired = {
@@ -328,6 +347,9 @@ pub struct PendingTouch {
     /// Where the primary point went down; anchors the long-press
     /// slop radius.
     down_pos: Option<(f64, f64)>,
+    /// Squared slop radius (from `touch_long_press_slop`) read when
+    /// the primary went down.
+    long_press_slop_sq: f64,
     /// The long-press conversion timer may still fire.
     long_press_armed: bool,
     /// The long-press timer converted this touch into a held right
@@ -343,6 +365,7 @@ impl PendingTouch {
             coords: None,
             clicks: vec![],
             down_pos: None,
+            long_press_slop_sq: LONG_PRESS_SLOP * LONG_PRESS_SLOP,
             long_press_armed: false,
             right_held: false,
         }))

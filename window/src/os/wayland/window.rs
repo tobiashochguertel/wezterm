@@ -621,7 +621,7 @@ pub struct WaylandWindowInner {
     // font_config: Rc<FontConfiguration>,
     text_cursor: Option<Rect>,
     appearance: Appearance,
-    config: ConfigHandle,
+    pub(crate) config: ConfigHandle,
     // cache the title for comparison to avoid spamming
     // the compositor with updates that don't actually change it
     title: Option<String>,

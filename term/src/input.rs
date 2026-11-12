@@ -78,11 +78,24 @@ impl LastMouseClick {
     }
 
     pub fn add(&self, button: MouseButton, position: ClickPosition) -> Self {
+        self.add_with_interval(
+            button,
+            position,
+            Duration::from_millis(CLICK_INTERVAL),
+        )
+    }
+
+    pub fn add_with_interval(
+        &self,
+        button: MouseButton,
+        position: ClickPosition,
+        interval: Duration,
+    ) -> Self {
         let now = Instant::now();
         let streak = if button == self.button
             && position.column == self.position.column
             && position.row == self.position.row
-            && now.duration_since(self.time) <= Duration::from_millis(CLICK_INTERVAL)
+            && now.duration_since(self.time) <= interval
         {
             self.streak + 1
         } else {
