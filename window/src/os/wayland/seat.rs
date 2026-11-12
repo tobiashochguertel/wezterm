@@ -51,9 +51,12 @@ impl SeatHandler for WaylandState {
                     .expect("Failed to create pointer");
                 self.pointer = Some(pointer);
             }
-            Capability::Touch /* if self.touch.is_none() */ => {
+            Capability::Touch if self.touch.is_none() => {
                 log::trace!("Setting touch capability");
-                // TODO
+                match self.seat.get_touch(qh, &seat) {
+                    Ok(touch) => self.touch = Some(touch),
+                    Err(err) => log::warn!("Couldn't bind touch: {err}"),
+                }
             }
             _ => {}
         }
@@ -88,7 +91,7 @@ impl SeatHandler for WaylandState {
             }
             Capability::Touch => {
                 log::trace!("Lost touch capability");
-                // Nothing to do here. (yet)
+                self.touch.take().map(|t| t.release());
             }
             _ => {}
         }

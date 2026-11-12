@@ -85,6 +85,7 @@ impl WaylandDimensions for Dimensions {
 
 use super::pointer::{PendingMouse, PointerUserData};
 use super::state::WaylandState;
+use super::touch::PendingTouch;
 
 #[derive(Debug)]
 pub(super) struct KeyRepeatState {
@@ -293,10 +294,16 @@ impl WaylandWindow {
         window.commit();
 
         let pending_mouse = PendingMouse::create(window_id);
+        let pending_touch = PendingTouch::create(window_id);
 
         {
-            let surface_to_pending = &mut conn.wayland_state.borrow_mut().surface_to_pending;
-            surface_to_pending.insert(surface.id(), Arc::clone(&pending_mouse));
+            let state = &mut conn.wayland_state.borrow_mut();
+            state
+                .surface_to_pending
+                .insert(surface.id(), Arc::clone(&pending_mouse));
+            state
+                .surface_to_touch
+                .insert(surface.id(), Arc::clone(&pending_touch));
         }
 
         let appearance = conn.get_appearance();
@@ -321,6 +328,7 @@ impl WaylandWindow {
             key_repeat: None,
             pending_event,
             pending_mouse,
+            pending_touch,
 
             pending_first_configure: Some(pending_first_configure),
             frame_callback: None,
@@ -598,6 +606,7 @@ pub struct WaylandWindowInner {
     pub(super) key_repeat: Option<(u32, Arc<Mutex<KeyRepeatState>>)>,
     pub(super) pending_event: Arc<Mutex<PendingEvent>>,
     pub(super) pending_mouse: Arc<Mutex<PendingMouse>>,
+    pub(super) pending_touch: Arc<Mutex<PendingTouch>>,
     pending_first_configure: Option<async_channel::Sender<()>>,
     frame_callback: Option<WlCallback>,
     invalidated: bool,
@@ -823,6 +832,58 @@ impl WaylandWindowInner {
 
         if !PendingMouse::in_window(&pending_mouse) {
             self.events.dispatch(WindowEvent::MouseLeave);
+            self.refresh_frame();
+        }
+    }
+
+    /// Dispatch buffered touch input as its mouse equivalent: the primary
+    /// touch point is treated as the pointer — motion becomes Move and
+    /// down/up become Press/Release of the left button, so taps and drags
+    /// behave exactly like clicks and selections throughout the UI.
+    pub(crate) fn dispatch_pending_touch(&mut self) {
+        let pending_touch = Arc::clone(&self.pending_touch);
+
+        if let Some((x, y)) = PendingTouch::coords(&pending_touch) {
+            let coords = Point::new(
+                self.surface_to_pixels(x as i32) as isize,
+                self.surface_to_pixels(y as i32) as isize,
+            );
+            self.last_mouse_coords = coords;
+            let event = MouseEvent {
+                kind: MouseEventKind::Move,
+                coords,
+                screen_coords: ScreenPoint::new(
+                    coords.x + self.dimensions.pixel_width as isize,
+                    coords.y + self.dimensions.pixel_height as isize,
+                ),
+                mouse_buttons: self.mouse_buttons,
+                modifiers: self.modifiers,
+            };
+            self.events.dispatch(WindowEvent::MouseEvent(event));
+            self.refresh_frame();
+        }
+
+        while let Some(state) = PendingTouch::next_click(&pending_touch) {
+            if state == ButtonState::Pressed {
+                self.mouse_buttons |= MouseButtons::LEFT;
+            } else {
+                self.mouse_buttons -= MouseButtons::LEFT;
+            }
+
+            let event = MouseEvent {
+                kind: match state {
+                    ButtonState::Pressed => MouseEventKind::Press(MousePress::Left),
+                    _ => MouseEventKind::Release(MousePress::Left),
+                },
+                coords: self.last_mouse_coords,
+                screen_coords: ScreenPoint::new(
+                    self.last_mouse_coords.x + self.dimensions.pixel_width as isize,
+                    self.last_mouse_coords.y + self.dimensions.pixel_height as isize,
+                ),
+                mouse_buttons: self.mouse_buttons,
+                modifiers: self.modifiers,
+            };
+            self.events.dispatch(WindowEvent::MouseEvent(event));
             self.refresh_frame();
         }
     }

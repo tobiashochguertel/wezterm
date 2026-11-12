@@ -23,12 +23,13 @@ use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::subcompositor::SubcompositorState;
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_data_device, delegate_output, delegate_pointer, delegate_primary_selection, delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor, delegate_xdg_shell, delegate_xdg_window, registry_handlers
+    delegate_compositor, delegate_data_device, delegate_output, delegate_pointer, delegate_primary_selection, delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor, delegate_touch, delegate_xdg_shell, delegate_xdg_window, registry_handlers
 };
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_output::WlOutput;
+use wayland_client::protocol::wl_touch::WlTouch;
 use wayland_client::{delegate_dispatch, Connection, QueueHandle};
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
@@ -40,6 +41,7 @@ use crate::x11::KeyboardWithFallback;
 use super::copy_and_paste::CopyPasteOffer;
 use super::inputhandler::{TextInputData, TextInputState};
 use super::pointer::{PendingMouse, PointerUserData};
+use super::touch::PendingTouch;
 use super::{OutputManagerData, OutputManagerState, SurfaceUserData, WaylandWindowInner};
 
 // We can't combine WaylandState and WaylandConnection together because
@@ -65,6 +67,10 @@ pub(super) struct WaylandState {
 
     pub(super) pointer: Option<ThemedPointer<PointerUserData>>,
     pub(super) surface_to_pending: HashMap<ObjectId, Arc<Mutex<PendingMouse>>>,
+    pub(super) touch: Option<WlTouch>,
+    pub(super) surface_to_touch: HashMap<ObjectId, Arc<Mutex<PendingTouch>>>,
+    /// Maps a live touch id to the surface it went down on.
+    pub(super) touch_to_surface: HashMap<i32, ObjectId>,
 
     /// Bound global for wl_data_device_manager; factory for data devices and copy-paste sources.
     pub(super) data_device_manager_state: DataDeviceManagerState,
@@ -130,6 +136,9 @@ impl WaylandState {
             keyboard_window_id: None,
             pointer: None,
             surface_to_pending: HashMap::new(),
+            touch: None,
+            surface_to_touch: HashMap::new(),
+            touch_to_surface: HashMap::new(),
             data_device_manager_state: DataDeviceManagerState::bind(globals, qh)?,
             data_device: None,
             copy_paste_offer: CopyPasteOffer::create(),
@@ -192,6 +201,7 @@ delegate_seat!(WaylandState);
 delegate_data_device!(WaylandState);
 
 delegate_pointer!(WaylandState, pointer: [PointerUserData]);
+delegate_touch!(WaylandState);
 
 delegate_xdg_shell!(WaylandState);
 delegate_xdg_window!(WaylandState);
