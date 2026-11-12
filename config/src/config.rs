@@ -473,6 +473,12 @@ pub struct Config {
     #[dynamic(default = "default_touch_long_press_slop")]
     pub touch_long_press_slop: f64,
 
+    /// On touch devices (Wayland), a two-finger drag is converted into
+    /// mouse wheel scroll events. This value scales the scroll speed;
+    /// 0 disables two-finger scrolling entirely.
+    #[dynamic(default = "default_touch_scroll_multiplier")]
+    pub touch_scroll_multiplier: f64,
+
     #[dynamic(default)]
     pub daemon_options: DaemonOptions,
 
@@ -1734,6 +1740,10 @@ fn default_touch_long_press_ms() -> u64 {
 
 fn default_touch_long_press_slop() -> f64 {
     10.0
+}
+
+fn default_touch_scroll_multiplier() -> f64 {
+    1.0
 }
 
 const MAX_SCROLLBACK_LINES: usize = 999_999_999;

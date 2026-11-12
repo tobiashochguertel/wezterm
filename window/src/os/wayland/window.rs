@@ -901,6 +901,21 @@ impl WaylandWindowInner {
             self.events.dispatch(WindowEvent::MouseEvent(event));
             self.refresh_frame();
         }
+
+        while let Some(amount) = PendingTouch::next_wheel(&pending_touch) {
+            let event = MouseEvent {
+                kind: MouseEventKind::VertWheel(amount),
+                coords: self.last_mouse_coords,
+                screen_coords: ScreenPoint::new(
+                    self.last_mouse_coords.x + self.dimensions.pixel_width as isize,
+                    self.last_mouse_coords.y + self.dimensions.pixel_height as isize,
+                ),
+                mouse_buttons: self.mouse_buttons,
+                modifiers: self.modifiers,
+            };
+            self.events.dispatch(WindowEvent::MouseEvent(event));
+            self.refresh_frame();
+        }
     }
 
     pub(crate) fn dispatch_pending_event(&mut self) {

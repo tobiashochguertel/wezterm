@@ -21,6 +21,9 @@ const LONG_PRESS_DELAY: Duration = Duration::from_millis(500);
 /// Squared slop radius (in surface-local units) for the long-press
 /// conversion: moving further than this cancels it and stays a drag.
 const LONG_PRESS_SLOP: f64 = 10.0;
+/// Surface-local drag distance that maps to one mouse wheel notch
+/// during a two-finger scroll.
+const SCROLL_PX_PER_NOTCH: f64 = 40.0;
 
 /// Where a live touch id went down.
 #[derive(Clone, Debug)]
@@ -91,8 +94,10 @@ impl TouchHandler for WaylandState {
             .insert(id, TouchTarget::Content(surface_id.clone()));
         if let Some(pending) = self.surface_to_touch.get(&surface_id) {
             let mut pending = pending.lock().unwrap();
+            pending.last_positions.insert(id, position);
             // The first live touch point acts as the pointer; later
-            // concurrent points on this surface are ignored until it ends
+            // concurrent points join the surface's point set — with two
+            // or more down, vertical motion scrolls (see `motion`).
             if pending.primary_id.is_none() {
                 pending.primary_id = Some(id);
                 pending.coords = Some(position);
@@ -123,6 +128,20 @@ impl TouchHandler for WaylandState {
                     Self::schedule_long_press(window_id, delay);
                 }
                 self.dispatch_pending_touch(window_id);
+            } else {
+                // A second finger turns pending gestures into a scroll:
+                // the long-press hold no longer applies, and the scroll
+                // speed is read once from the owning window's config.
+                pending.long_press_armed = false;
+                pending.scroll_acc = 0.0;
+                let window_id = pending.window_id;
+                pending.scroll_multiplier = {
+                    let windows = self.windows.borrow();
+                    windows
+                        .get(&window_id)
+                        .map(|w| w.borrow().config.touch_scroll_multiplier)
+                        .unwrap_or(1.0)
+                };
             }
         }
     }
@@ -162,6 +181,7 @@ impl TouchHandler for WaylandState {
             TouchTarget::Content(surface_id) => {
                 if let Some(pending) = self.surface_to_touch.get(&surface_id) {
                     let mut pending = pending.lock().unwrap();
+                    pending.last_positions.remove(&id);
                     if pending.primary_id == Some(id) {
                         pending.primary_id = None;
                         pending.long_press_armed = false;
@@ -207,7 +227,28 @@ impl TouchHandler for WaylandState {
             TouchTarget::Content(surface_id) => {
                 if let Some(pending) = self.surface_to_touch.get(&surface_id) {
                     let mut pending = pending.lock().unwrap();
-                    if pending.primary_id == Some(id) {
+                    let count = pending.last_positions.len();
+                    let Some(last) = pending.last_positions.get(&id).copied()
+                    else {
+                        return;
+                    };
+                    pending.last_positions.insert(id, position);
+                    if count >= 2 {
+                        // Two-finger drag: convert the average vertical
+                        // motion of the live points into wheel scroll.
+                        // Content follows the fingers — dragging down
+                        // scrolls back toward older output (WheelUp).
+                        let dy = position.1 - last.1;
+                        pending.scroll_acc +=
+                            dy * pending.scroll_multiplier / count as f64;
+                        while pending.scroll_acc.abs() >= SCROLL_PX_PER_NOTCH {
+                            let notch = pending.scroll_acc.signum() as i16;
+                            pending.wheels.push(notch);
+                            pending.scroll_acc -=
+                                SCROLL_PX_PER_NOTCH * pending.scroll_acc.signum();
+                        }
+                        self.dispatch_pending_touch(pending.window_id);
+                    } else if pending.primary_id == Some(id) {
                         if let Some(down) = pending.down_pos {
                             let dx = position.0 - down.0;
                             let dy = position.1 - down.1;
@@ -250,7 +291,7 @@ impl TouchHandler for WaylandState {
         // still-pressed primaries so windows and the decorations frame
         // aren't left with a stuck held button.
         self.press_grab = None;
-        for (_, target) in self.touch_to_surface.drain().collect::<Vec<(i32, TouchTarget)>>()
+        for (id, target) in self.touch_to_surface.drain().collect::<Vec<(i32, TouchTarget)>>()
         {
             match target {
                 TouchTarget::Frame(_surface_id, window_id) => {
@@ -266,6 +307,7 @@ impl TouchHandler for WaylandState {
                 TouchTarget::Content(surface_id) => {
                     if let Some(pending) = self.surface_to_touch.get(&surface_id) {
                         let mut pending = pending.lock().unwrap();
+                        pending.last_positions.remove(&id);
                         if pending.primary_id.take().is_some() {
                             pending.long_press_armed = false;
                             let button = if pending.right_held {
@@ -355,6 +397,17 @@ pub struct PendingTouch {
     /// The long-press timer converted this touch into a held right
     /// button; the matching release must be for the right button.
     right_held: bool,
+    /// Last known position of every live touch point on this surface,
+    /// used to compute two-finger scroll deltas.
+    last_positions: std::collections::HashMap<i32, (f64, f64)>,
+    /// Fractional scroll distance not yet emitted as whole wheel
+    /// notches.
+    scroll_acc: f64,
+    /// `touch_scroll_multiplier` for the owning window, read when the
+    /// second touch point went down. 0 disables two-finger scroll.
+    scroll_multiplier: f64,
+    /// Queued wheel notches to dispatch (positive = WheelUp).
+    wheels: Vec<i16>,
 }
 
 impl PendingTouch {
@@ -368,6 +421,10 @@ impl PendingTouch {
             long_press_slop_sq: LONG_PRESS_SLOP * LONG_PRESS_SLOP,
             long_press_armed: false,
             right_held: false,
+            last_positions: std::collections::HashMap::new(),
+            scroll_acc: 0.0,
+            scroll_multiplier: 1.0,
+            wheels: vec![],
         }))
     }
 
@@ -379,6 +436,15 @@ impl PendingTouch {
             None
         } else {
             Some(pending.clicks.remove(0))
+        }
+    }
+
+    pub(super) fn next_wheel(pending: &Arc<Mutex<Self>>) -> Option<i16> {
+        let mut pending = pending.lock().unwrap();
+        if pending.wheels.is_empty() {
+            None
+        } else {
+            Some(pending.wheels.remove(0))
         }
     }
 
